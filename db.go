@@ -8,14 +8,21 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	// each file can be 10MB in size
+	fileSizeThreshold = 10 * 1024 * 1024
 )
 
 type DB struct {
 	path       string
 	activeFile *os.File
-	data       map[string][]byte // this is likely sub-optimal
+	data       map[string]*KeyDir
 	m          sync.RWMutex
+	offset     *atomic.Int64
 }
 
 // Open creates a new database at the given path and returns a handle to it along with any errors.
@@ -30,13 +37,14 @@ func Open(baseDir string) (*DB, error) {
 	}
 
 	fileName := fmt.Sprintf("%d.active", time.Now().UTC().UnixNano())
-	f, err := os.OpenFile(path.Join(baseDir, fileName), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path.Join(baseDir, fileName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, err
 	}
 
 	d.activeFile = f
-	d.data = make(map[string][]byte)
+	d.data = make(map[string]*KeyDir)
+	d.offset = atomic.NewInt64(0)
 	return d, nil
 }
 
@@ -52,14 +60,20 @@ func (d *DB) Put(key string, val []byte) error {
 	}
 
 	// append to the active file
-	err = d.appendToActiveFile(entry)
+	num, err := d.appendToActiveFile(entry)
 	if err != nil {
 		return err
 	}
+	d.offset.Add(int64(num))
 
 	// update in memory map
 	d.m.Lock()
-	d.data[key] = copyBytes(val)
+	d.data[key] = &KeyDir{
+		FileId:      d.activeFile.Name(),
+		ValueSize:   int64(num),
+		ValueOffset: d.offset.Load(),
+		Timestamp:   time.Now().UnixNano(),
+	}
 	d.m.Unlock()
 	return nil
 }
@@ -80,23 +94,18 @@ func (d *DB) Path() string {
 	return d.path
 }
 
-func (d *DB) appendToActiveFile(entry *Entry) error {
+func (d *DB) appendToActiveFile(entry *Entry) (int, error) {
 	data, err := proto.Marshal(entry)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	_, err = d.activeFile.Write(data)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return d.activeFile.WriteAt(data, d.offset.Load())
 }
 
 func (d *DB) makeEntry(key string, val []byte) (*Entry, error) {
 	ed := &EntryData{
-		Timestamp: int32(time.Now().Unix()),
+		Timestamp: time.Now().UnixNano(),
 		KeySize:   int64(len(key)),
 		ValueSize: int64(len(val)),
 		Key:       key,

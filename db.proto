@@ -8,9 +8,16 @@ message Entry {
 }
 
 message EntryData {
-  int32 timestamp = 1;
+  int64 timestamp = 1;
   int64 key_size = 2;
   int64 value_size = 3;
   string key = 4;
   bytes value = 5;
+}
+
+message KeyDir {
+  string file_id = 1;
+  int64 value_size = 2;
+  int64 value_offset = 3;
+  int64 timestamp = 4;
 }
