@@ -1,6 +1,7 @@
 package bitcask
 
 import (
+	"bytes"
 	"os"
 	"testing"
 )
@@ -53,5 +54,39 @@ func TestPut(t *testing.T) {
 	err = d.Put("foo", []byte("bar"))
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGet(t *testing.T) {
+	d, err := testDB(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = d.Close() }()
+	defer func() { _ = os.RemoveAll(d.Path()) }()
+
+	err = d.Put("foo", []byte("bar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := d.Get("lol")
+	if err == nil {
+		t.Fatal("expected an error for an unknown key")
+	}
+	if err != ErrNotFound {
+		t.Fatal("expected a not found error for an unknown key")
+	}
+	if val != nil {
+		t.Fatal("expected a nil byte slice for an unknown key")
+	}
+
+	val, err = d.Get("foo")
+	if err != nil {
+		t.Fatalf("expected a nil error but got %v\n", err)
+	}
+	if !bytes.Equal(val, []byte("bar")) {
+		t.Fatalf("expected val to be %q, but it was %q", "bar", string(val))
 	}
 }

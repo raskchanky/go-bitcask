@@ -1,6 +1,7 @@
 package bitcask
 
 import (
+	"errors"
 	"fmt"
 	"hash/crc64"
 	"os"
@@ -15,6 +16,11 @@ import (
 const (
 	// each file can be 10MB in size
 	fileSizeThreshold = 10 * 1024 * 1024
+)
+
+var (
+	ErrNotFound         = errors.New("bitcask: not found")
+	ErrChecksumMismatch = errors.New("bitcask: checksum mismatch")
 )
 
 type DB struct {
@@ -48,11 +54,48 @@ func Open(baseDir string) (*DB, error) {
 	return d, nil
 }
 
-func (d *DB) Get(key []byte) ([]byte, error) {
-	return nil, nil
+func (d *DB) Get(key string) ([]byte, error) {
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	kd, ok := d.data[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	buf := make([]byte, kd.ValueSize)
+	// TODO: right now this reads straight from the active file but it should indirect to whatever file kd.FileId points to
+	_, err := d.activeFile.ReadAt(buf, kd.ValueOffset)
+	if err != nil {
+		return nil, err
+	}
+
+	var entry Entry
+	err = proto.Unmarshal(buf, &entry)
+	if err != nil {
+		return nil, err
+	}
+
+	ed, err := proto.Marshal(entry.EntryData)
+	if err != nil {
+		return nil, err
+	}
+
+	// check the crc
+	crc := entryDataChecksum(ed)
+	if crc != entry.Crc {
+		return nil, ErrChecksumMismatch
+	}
+
+	return copyBytes(entry.EntryData.Value), nil
 }
 
 func (d *DB) Put(key string, val []byte) error {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	currentOffset := d.offset.Load()
+
 	// construct a new entry using the key/val
 	entry, err := d.makeEntry(key, val)
 	if err != nil {
@@ -67,14 +110,13 @@ func (d *DB) Put(key string, val []byte) error {
 	d.offset.Add(int64(num))
 
 	// update in memory map
-	d.m.Lock()
 	d.data[key] = &KeyDir{
 		FileId:      d.activeFile.Name(),
 		ValueSize:   int64(num),
-		ValueOffset: d.offset.Load(),
+		ValueOffset: currentOffset,
 		Timestamp:   time.Now().UnixNano(),
 	}
-	d.m.Unlock()
+
 	return nil
 }
 
