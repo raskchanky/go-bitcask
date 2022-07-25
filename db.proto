@@ -1,0 +1,16 @@
+syntax = "proto3";
+option go_package = "github.com/raskchanky/go-bitcask/bitcask";
+package bitcask;
+
+message Entry {
+  uint64 crc = 1;
+  EntryData entry_data = 2;
+}
+
+message EntryData {
+  int32 timestamp = 1;
+  int64 key_size = 2;
+  int64 value_size = 3;
+  string key = 4;
+  bytes value = 5;
+}
