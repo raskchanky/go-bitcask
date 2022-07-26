@@ -9,16 +9,14 @@ message Entry {
 
 message EntryData {
   int64 timestamp = 1;
-  int64 key_size = 2;
-  int64 value_size = 3;
-  string key = 4;
-  bytes value = 5;
-  bool tombstone = 6;
+  string key = 2;
+  bytes value = 3;
+  bool tombstone = 4;
 }
 
 message KeyDir {
-  string file_id = 1;
-  int64 value_size = 2;
-  int64 value_offset = 3;
-  int64 timestamp = 4;
+  int64 timestamp = 1;
+  string file_id = 2;
+  int64 value_size = 3;
+  int64 value_offset = 4;
 }

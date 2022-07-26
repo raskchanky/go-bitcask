@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"hash/crc64"
 	"os"
-	"path"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +28,7 @@ var (
 )
 
 type DB struct {
-	path       string
+	baseDir    string
 	activeFile *os.File
 	data       map[string]*KeyDir
 	m          sync.RWMutex
@@ -37,7 +38,8 @@ type DB struct {
 // Open creates a new database at the given path and returns a handle to it along with any errors.
 func Open(baseDir string) (*DB, error) {
 	d := &DB{
-		path: baseDir,
+		baseDir: baseDir,
+		offset:  atomic.NewInt64(0),
 	}
 
 	err := os.MkdirAll(baseDir, 0o600)
@@ -45,15 +47,15 @@ func Open(baseDir string) (*DB, error) {
 		return nil, err
 	}
 
-	fileName := fmt.Sprintf("%d.active", time.Now().UTC().UnixNano())
-	f, err := os.OpenFile(path.Join(baseDir, fileName), os.O_RDWR|os.O_CREATE, 0o600)
+	// TODO: this needs to be a bit smarter. are there files in the directory already? then populate this from
+	// the existing files. If not, then create it fresh.
+	d.data = make(map[string]*KeyDir)
+	err = d.newActiveFile()
 	if err != nil {
 		return nil, err
 	}
 
-	d.activeFile = f
-	d.data = make(map[string]*KeyDir)
-	d.offset = atomic.NewInt64(0)
+	go d.fileRotation()
 	return d, nil
 }
 
@@ -120,11 +122,6 @@ func (d *DB) Put(key string, val []byte) error {
 		Timestamp:   time.Now().UnixNano(),
 	}
 
-	// TODO: when the currently active file hits the file size threshold, it should be closed
-	// and a new file started.
-
-	// TODO: every X reads or writes should trigger a background compaction of the non-active files
-
 	return nil
 }
 
@@ -161,7 +158,7 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) Path() string {
-	return d.path
+	return d.baseDir
 }
 
 func (d *DB) appendToActiveFile(entry *Entry) (int, error) {
@@ -170,14 +167,13 @@ func (d *DB) appendToActiveFile(entry *Entry) (int, error) {
 		return 0, err
 	}
 
+	// TODO: we might need to Sync() here
 	return d.activeFile.WriteAt(data, d.offset.Load())
 }
 
 func (d *DB) makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
 	ed := &EntryData{
 		Timestamp: time.Now().UnixNano(),
-		KeySize:   int64(len(key)),
-		ValueSize: int64(len(val)),
 		Key:       key,
 		Value:     copyBytes(val),
 		Tombstone: tombstone,
@@ -194,6 +190,95 @@ func (d *DB) makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
 	}
 
 	return entry, nil
+}
+
+func (d *DB) fileRotation() {
+	for {
+		fi, err := d.activeFile.Stat()
+		if err != nil {
+			// TODO: handle this more gracefully
+			panic(err)
+		}
+
+		if fi.Size() < fileSizeThreshold {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+
+		// file has exceeded the threshold, close it and start a new one
+		d.m.Lock()
+		err = d.activeFile.Sync()
+		if err != nil {
+			// TODO: handle this more gracefully
+			panic(err)
+		}
+
+		err = d.activeFile.Close()
+		if err != nil {
+			// TODO: handle this more gracefully
+			panic(err)
+		}
+
+		// rename existing file
+		fullPath := filepath.Join(d.baseDir, fi.Name())
+		parts := strings.Split(fi.Name(), ".")
+		newPath := fmt.Sprintf("%s.stable", parts[0])
+		err = os.Rename(fullPath, newPath)
+
+		// start a new file
+		err = d.newActiveFile()
+		if err != nil {
+			// TODO: handle this more gracefully
+			panic(err)
+		}
+		d.m.Unlock()
+
+		go d.compactStableFiles()
+	}
+}
+
+func (d *DB) compactStableFiles() {
+	// d.m.RLock()
+	// baseDir := d.baseDir
+	// d.m.RUnlock()
+	//
+	// f, err := os.Open(baseDir)
+	// if err != nil {
+	// 	// TODO: handle this more gracefully
+	// 	panic(err)
+	// }
+	//
+	// dirEntries, err := f.ReadDir(0)
+	// if err != nil {
+	// 	// TODO: handle this more gracefully
+	// 	panic(err)
+	// }
+	//
+	// for _, de := range dirEntries {
+	// 	if !strings.HasSuffix(de.Name(), ".stable") {
+	// 		continue
+	// 	}
+	//
+	// 	sf, err := os.Open(de.Name())
+	// 	if err != nil {
+	// 		// TODO: handle this more gracefully
+	// 		panic(err)
+	// 	}
+	// }
+}
+
+// this should be called either at startup or with the lock held
+func (d *DB) newActiveFile() error {
+	fileName := fmt.Sprintf("%d.active", time.Now().UTC().UnixNano())
+	newFullPath := filepath.Join(d.baseDir, fileName)
+	f, err := os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+
+	d.activeFile = f
+	d.offset.Store(0)
+	return nil
 }
 
 func copyBytes(val []byte) []byte {
