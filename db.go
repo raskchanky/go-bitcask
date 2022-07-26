@@ -2,6 +2,7 @@ package bitcask
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc64"
@@ -19,6 +20,7 @@ import (
 const (
 	// each file can be 10MB in size
 	fileSizeThreshold = 10 * 1024 * 1024
+	sizeBufferSize    = 4
 )
 
 var (
@@ -61,22 +63,41 @@ func Open(baseDir string) (*DB, error) {
 
 func (d *DB) Get(key string) ([]byte, error) {
 	d.m.RLock()
-	defer d.m.RUnlock()
-
 	kd, ok := d.data[key]
+	d.m.RUnlock()
+
+	// look up the keydir associated with this key. if it's not there, we don't have it.
 	if !ok {
 		return nil, ErrNotFound
 	}
 
-	buf := make([]byte, kd.ValueSize)
-	// TODO: right now this reads straight from the active file but it should indirect to whatever file kd.FileId points to
-	_, err := d.activeFile.ReadAt(buf, kd.ValueOffset)
+	// kd.Offset tells us where to start reading. The first thing we'll read is the size,
+	// in a fixed 4 byte buffer.
+	offset := kd.Offset
+	buf := make([]byte, sizeBufferSize)
+	f, err := os.Open(kd.FileId)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	num, err := f.ReadAt(buf, offset)
+	if err != nil {
+		return nil, err
+	}
+
+	offset += int64(num)
+	readSize := binary.LittleEndian.Uint32(buf)
+	msg := make([]byte, readSize)
+
+	// Now that we know how big the proto is, read that out as well
+	_, err = f.ReadAt(msg, offset)
 	if err != nil {
 		return nil, err
 	}
 
 	var entry Entry
-	err = proto.Unmarshal(buf, &entry)
+	err = proto.Unmarshal(msg, &entry)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +120,7 @@ func (d *DB) Put(key string, val []byte) error {
 	d.m.Lock()
 	defer d.m.Unlock()
 
-	currentOffset := d.offset.Load()
+	startingOffset := d.offset.Load()
 
 	// construct a new entry using the key/val
 	entry, err := d.makeEntry(key, val, bytes.Equal(tombstoneValue, val))
@@ -107,22 +128,37 @@ func (d *DB) Put(key string, val []byte) error {
 		return err
 	}
 
-	// append to the active file
-	num, err := d.appendToActiveFile(entry)
+	// append to the active file, writing the size first
+	data, err := proto.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	d.offset.Add(int64(num))
 
-	// update in memory map
-	d.data[key] = &KeyDir{
-		FileId:      d.activeFile.Name(),
-		ValueSize:   int64(num),
-		ValueOffset: currentOffset,
-		Timestamp:   time.Now().UnixNano(),
+	buf := make([]byte, sizeBufferSize)
+	binary.LittleEndian.PutUint32(buf, uint32(len(data)))
+
+	num, err := d.activeFile.WriteAt(buf, startingOffset)
+	if err != nil {
+		return err
 	}
 
-	return nil
+	// Now that the size is written, append the encoded protobuf
+	currentOffset := startingOffset + int64(num)
+	num, err = d.activeFile.WriteAt(data, currentOffset)
+	if err != nil {
+		return err
+	}
+	currentOffset += int64(num)
+	d.offset.Store(currentOffset)
+
+	// update in memory map, using the starting instead of ending offset
+	d.data[key] = &KeyDir{
+		FileId:    d.activeFile.Name(),
+		Offset:    startingOffset,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	return d.activeFile.Sync()
 }
 
 func (d *DB) Delete(key string) error {
@@ -159,16 +195,6 @@ func (d *DB) Close() error {
 
 func (d *DB) Path() string {
 	return d.baseDir
-}
-
-func (d *DB) appendToActiveFile(entry *Entry) (int, error) {
-	data, err := proto.Marshal(entry)
-	if err != nil {
-		return 0, err
-	}
-
-	// TODO: we might need to Sync() here
-	return d.activeFile.WriteAt(data, d.offset.Load())
 }
 
 func (d *DB) makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {

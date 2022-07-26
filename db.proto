@@ -17,6 +17,5 @@ message EntryData {
 message KeyDir {
   int64 timestamp = 1;
   string file_id = 2;
-  int64 value_size = 3;
-  int64 value_offset = 4;
+  int64 offset = 3;
 }
