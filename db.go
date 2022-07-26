@@ -1,6 +1,7 @@
 package bitcask
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash/crc64"
@@ -21,6 +22,7 @@ const (
 var (
 	ErrNotFound         = errors.New("bitcask: not found")
 	ErrChecksumMismatch = errors.New("bitcask: checksum mismatch")
+	tombstoneValue      = []byte("\U0001FAA6")
 )
 
 type DB struct {
@@ -97,7 +99,7 @@ func (d *DB) Put(key string, val []byte) error {
 	currentOffset := d.offset.Load()
 
 	// construct a new entry using the key/val
-	entry, err := d.makeEntry(key, val)
+	entry, err := d.makeEntry(key, val, bytes.Equal(tombstoneValue, val))
 	if err != nil {
 		return err
 	}
@@ -120,7 +122,18 @@ func (d *DB) Put(key string, val []byte) error {
 	return nil
 }
 
-func (d *DB) Delete(key []byte) error {
+func (d *DB) Delete(key string) error {
+	// write special tombstone record to the active file
+	err := d.Put(key, tombstoneValue)
+	if err != nil {
+		return err
+	}
+
+	// remove keydir entry for given key
+	d.m.Lock()
+	delete(d.data, key)
+	d.m.Unlock()
+
 	return nil
 }
 
@@ -145,13 +158,14 @@ func (d *DB) appendToActiveFile(entry *Entry) (int, error) {
 	return d.activeFile.WriteAt(data, d.offset.Load())
 }
 
-func (d *DB) makeEntry(key string, val []byte) (*Entry, error) {
+func (d *DB) makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
 	ed := &EntryData{
 		Timestamp: time.Now().UnixNano(),
 		KeySize:   int64(len(key)),
 		ValueSize: int64(len(val)),
 		Key:       key,
 		Value:     copyBytes(val),
+		Tombstone: tombstone,
 	}
 
 	edBytes, err := proto.Marshal(ed)
