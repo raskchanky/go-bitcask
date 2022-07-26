@@ -7,6 +7,7 @@ import (
 	"hash/crc64"
 	"os"
 	"path"
+	"sort"
 	"sync"
 	"time"
 
@@ -119,6 +120,11 @@ func (d *DB) Put(key string, val []byte) error {
 		Timestamp:   time.Now().UnixNano(),
 	}
 
+	// TODO: when the currently active file hits the file size threshold, it should be closed
+	// and a new file started.
+
+	// TODO: every X reads or writes should trigger a background compaction of the non-active files
+
 	return nil
 }
 
@@ -137,8 +143,17 @@ func (d *DB) Delete(key string) error {
 	return nil
 }
 
-func (d *DB) List() [][]byte {
-	return nil
+func (d *DB) List() []string {
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	keys := make([]string, 0, len(d.data))
+	for k := range d.data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	return keys
 }
 
 func (d *DB) Close() error {

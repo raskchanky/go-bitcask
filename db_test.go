@@ -2,8 +2,12 @@ package bitcask
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 func testDB(t *testing.T) (*DB, error) {
@@ -42,7 +46,7 @@ func TestOpen(t *testing.T) {
 	}
 }
 
-func TestPut(t *testing.T) {
+func TestCRUD(t *testing.T) {
 	d, err := testDB(t)
 	if err != nil {
 		t.Fatal(err)
@@ -51,78 +55,30 @@ func TestPut(t *testing.T) {
 	defer func() { _ = d.Close() }()
 	defer func() { _ = os.RemoveAll(d.Path()) }()
 
-	err = d.Put("foo", []byte("bar"))
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestGet(t *testing.T) {
-	d, err := testDB(t)
-	if err != nil {
-		t.Fatal(err)
+	// add 5 kv pairs
+	for i := 0; i < 5; i++ {
+		err = d.Put(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("value-%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	defer func() { _ = d.Close() }()
-	defer func() { _ = os.RemoveAll(d.Path()) }()
+	// check to make sure they're all there
+	for i := 0; i < 5; i++ {
+		k := fmt.Sprintf("key-%d", i)
+		v := []byte(fmt.Sprintf("value-%d", i))
 
-	err = d.Put("foo", []byte("bar"))
-	if err != nil {
-		t.Fatal(err)
+		val, err := d.Get(k)
+		if err != nil {
+			t.Fatalf("expected a nil error but got %v\n", err)
+		}
+		if !bytes.Equal(val, v) {
+			t.Fatalf("expected value for %q to be %q, but it was %q", k, string(v), string(val))
+		}
 	}
 
+	// try to get something that doesn't exist and it should error
 	val, err := d.Get("lol")
-	if err == nil {
-		t.Fatal("expected an error for an unknown key")
-	}
-	if err != ErrNotFound {
-		t.Fatal("expected a not found error for an unknown key")
-	}
-	if val != nil {
-		t.Fatal("expected a nil byte slice for an unknown key")
-	}
-
-	val, err = d.Get("foo")
-	if err != nil {
-		t.Fatalf("expected a nil error but got %v\n", err)
-	}
-	if !bytes.Equal(val, []byte("bar")) {
-		t.Fatalf("expected val to be %q, but it was %q", "bar", string(val))
-	}
-}
-
-func TestDelete(t *testing.T) {
-	d, err := testDB(t)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	defer func() { _ = d.Close() }()
-	defer func() { _ = os.RemoveAll(d.Path()) }()
-
-	// add a kv pair
-	err = d.Put("foo", []byte("bar"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// make sure it's there
-	val, err := d.Get("foo")
-	if err != nil {
-		t.Fatalf("expected a nil error but got %v\n", err)
-	}
-	if !bytes.Equal(val, []byte("bar")) {
-		t.Fatalf("expected val to be %q, but it was %q", "bar", string(val))
-	}
-
-	// delete it
-	err = d.Delete("foo")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// shouldn't be able to find it any more
-	val, err = d.Get("foo")
 	if err == nil {
 		t.Fatal("expected an error for a deleted key")
 	}
@@ -131,5 +87,30 @@ func TestDelete(t *testing.T) {
 	}
 	if val != nil {
 		t.Fatal("expected a nil byte slice for a deleted key")
+	}
+
+	// delete one of the keys
+	err = d.Delete("key-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// shouldn't be able to find it any more
+	val, err = d.Get("key-2")
+	if err == nil {
+		t.Fatal("expected an error for a deleted key")
+	}
+	if err != ErrNotFound {
+		t.Fatal("expected a not found error for a deleted key")
+	}
+	if val != nil {
+		t.Fatal("expected a nil byte slice for a deleted key")
+	}
+
+	// listing keys should return the remaining 4, in sorted order
+	keys := d.List()
+	expectedKeys := []string{"key-0", "key-1", "key-3", "key-4"}
+	if !cmp.Equal(keys, expectedKeys, cmpopts.EquateEmpty(), cmpopts.SortSlices(func(a string, b string) bool { return a < b })) {
+		t.Fatalf("expected %v to equal %v but it didn't", keys, expectedKeys)
 	}
 }
