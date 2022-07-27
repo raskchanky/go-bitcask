@@ -45,6 +45,7 @@ func Open(baseDir string) (*DB, error) {
 		baseDir:           baseDir,
 		offset:            atomic.NewInt64(0),
 		compactionRunning: atomic.NewBool(false),
+		data:              make(map[string]*KeyDir),
 	}
 
 	err := os.MkdirAll(baseDir, 0o600)
@@ -52,10 +53,7 @@ func Open(baseDir string) (*DB, error) {
 		return nil, err
 	}
 
-	// TODO: this needs to be a bit smarter. are there files in the directory already? then populate this from
-	// the existing files. If not, then create it fresh.
-	d.data = make(map[string]*KeyDir)
-	err = d.newActiveFile()
+	err = d.populateData()
 	if err != nil {
 		return nil, err
 	}
@@ -149,25 +147,60 @@ func (d *DB) Path() string {
 	return d.baseDir
 }
 
-func makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
-	ed := &EntryData{
-		Timestamp: time.Now().UnixNano(),
-		Key:       key,
-		Value:     copyBytes(val),
-		Tombstone: tombstone,
-	}
+// populateData checks to see if there are files in the base directory. If so, it uses them to populate
+// a new KeyDir. If not, it creates a new active file.
+// TODO: this should be using hint files if they're available
+func (d *DB) populateData() error {
+	d.m.RLock()
+	baseDir := d.baseDir
+	d.m.RUnlock()
 
-	edBytes, err := proto.Marshal(ed)
+	f, err := os.Open(baseDir)
 	if err != nil {
-		return nil, fmt.Errorf("error marshaling data: %w", err)
+		// TODO: handle this more gracefully
+		panic(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dirEntries, err := f.ReadDir(0)
+	if err != nil {
+		// TODO: handle this more gracefully
+		panic(err)
 	}
 
-	entry := &Entry{
-		Crc:       entryDataChecksum(edBytes),
-		EntryData: ed,
+	if len(dirEntries) == 0 {
+		return d.newActiveFile()
 	}
 
-	return entry, nil
+	for _, de := range dirEntries {
+		sf, err := os.Open(de.Name())
+		if err != nil {
+			// TODO: handle this more gracefully
+			panic(err)
+		}
+
+		for {
+			var sfOffset int64
+			entry, sfOffset, err := readProtoFromFile(sf, sfOffset)
+			if err == io.EOF {
+				break
+			}
+
+			kd := &KeyDir{
+				Timestamp: entry.EntryData.Timestamp,
+				FileId:    de.Name(),
+				Offset:    sfOffset,
+			}
+
+			d.m.Lock()
+			d.data[entry.EntryData.Key] = kd
+			d.m.Unlock()
+		}
+
+		_ = sf.Close()
+	}
+
+	return nil
 }
 
 func (d *DB) fileRotation() {
@@ -217,6 +250,7 @@ func (d *DB) fileRotation() {
 	}
 }
 
+// TODO: this should be writing out hint files
 func (d *DB) compactStableFiles() {
 	d.compactionRunning.Store(true)
 	defer d.compactionRunning.Store(false)
@@ -233,6 +267,7 @@ func (d *DB) compactStableFiles() {
 		// TODO: handle this more gracefully
 		panic(err)
 	}
+	defer func() { _ = f.Close() }()
 
 	dirEntries, err := f.ReadDir(0)
 	if err != nil {
@@ -274,6 +309,7 @@ func (d *DB) compactStableFiles() {
 		}
 
 		toDelete[de.Name()] = struct{}{}
+		_ = sf.Close()
 	}
 
 	var currentSize, startingOffset, endingOffset int64
@@ -329,6 +365,27 @@ func (d *DB) newActiveFile() error {
 	d.activeFile = f
 	d.offset.Store(0)
 	return nil
+}
+
+func makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
+	ed := &EntryData{
+		Timestamp: time.Now().UnixNano(),
+		Key:       key,
+		Value:     copyBytes(val),
+		Tombstone: tombstone,
+	}
+
+	edBytes, err := proto.Marshal(ed)
+	if err != nil {
+		return nil, fmt.Errorf("error marshaling data: %w", err)
+	}
+
+	entry := &Entry{
+		Crc:       entryDataChecksum(edBytes),
+		EntryData: ed,
+	}
+
+	return entry, nil
 }
 
 func writeProtoToFile(f *os.File, entry *Entry, offset int64) (int64, error) {
