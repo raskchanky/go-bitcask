@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ var (
 	ErrNotFound         = errors.New("bitcask: not found")
 	ErrChecksumMismatch = errors.New("bitcask: checksum mismatch")
 	tombstoneValue      = []byte("\U0001FAA6")
+	filenameRegex       = regexp.MustCompile(`^bitcask\.[0-9]+\.(active|stable)$`)
 )
 
 type DB struct {
@@ -37,6 +39,7 @@ type DB struct {
 	m                 sync.RWMutex
 	offset            *atomic.Int64
 	compactionRunning *atomic.Bool
+	compactionCh      chan struct{}
 }
 
 // Open creates a new database at the given path and returns a handle to it along with any errors.
@@ -46,9 +49,15 @@ func Open(baseDir string) (*DB, error) {
 		offset:            atomic.NewInt64(0),
 		compactionRunning: atomic.NewBool(false),
 		data:              make(map[string]*KeyDir),
+		compactionCh:      make(chan struct{}),
 	}
 
-	err := os.MkdirAll(baseDir, 0o600)
+	fi, err := os.Stat(baseDir)
+	if err == nil && !fi.IsDir() {
+		return nil, errors.New(fmt.Sprintf("%s is not a directory", baseDir))
+	}
+
+	err = os.MkdirAll(baseDir, 0o700)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +67,6 @@ func Open(baseDir string) (*DB, error) {
 		return nil, err
 	}
 
-	go d.fileRotation()
 	return d, nil
 }
 
@@ -72,8 +80,6 @@ func (d *DB) Get(key string) ([]byte, error) {
 		return nil, ErrNotFound
 	}
 
-	// kd.Offset tells us where to start reading. The first thing we'll read is the size,
-	// in a fixed 4 byte buffer.
 	f, err := os.Open(kd.FileId)
 	if err != nil {
 		return nil, err
@@ -102,13 +108,20 @@ func (d *DB) Put(key string, val []byte) error {
 	d.offset.Store(currentOffset)
 
 	// update in memory map, using the starting instead of ending offset
+	fullPath := filepath.Join(d.baseDir, d.activeFile.Name())
 	d.data[key] = &KeyDir{
-		FileId:    d.activeFile.Name(),
+		FileId:    fullPath,
 		Offset:    startingOffset,
 		Timestamp: entry.EntryData.Timestamp,
 	}
 
-	return d.activeFile.Sync()
+	err = d.activeFile.Sync()
+	if err != nil {
+		return err
+	}
+
+	go d.fileRotation()
+	return nil
 }
 
 func (d *DB) Delete(key string) error {
@@ -140,7 +153,22 @@ func (d *DB) List() []string {
 }
 
 func (d *DB) Close() error {
-	return d.activeFile.Close()
+	// Wait for compaction to finish if it's in progress
+	if d.compactionRunning.Load() {
+		<-d.compactionCh
+	}
+
+	close(d.compactionCh)
+
+	d.m.Lock()
+	err := d.activeFile.Close()
+	d.m.Unlock()
+
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (d *DB) Path() string {
@@ -151,11 +179,11 @@ func (d *DB) Path() string {
 // a new KeyDir. If not, it creates a new active file.
 // TODO: this should be using hint files if they're available
 func (d *DB) populateData() error {
-	d.m.RLock()
-	baseDir := d.baseDir
-	d.m.RUnlock()
+	d.m.Lock()
+	defer d.m.Unlock()
 
-	f, err := os.Open(baseDir)
+	var activeFile string
+	f, err := os.Open(d.baseDir)
 	if err != nil {
 		// TODO: handle this more gracefully
 		panic(err)
@@ -173,93 +201,135 @@ func (d *DB) populateData() error {
 	}
 
 	for _, de := range dirEntries {
-		sf, err := os.Open(de.Name())
+		if !filenameRegex.MatchString(de.Name()) {
+			// TODO: log this somehow
+			continue
+		}
+
+		dePath := filepath.Join(d.baseDir, de.Name())
+		sf, err := os.Open(dePath)
 		if err != nil {
 			// TODO: handle this more gracefully
 			panic(err)
 		}
 
+		sfOffset := int64(0)
+		// TODO: this would probably work better with some kind of buffering, e.g. read in
+		// 4K at a time from the file and process that, rather than reading record at a time.
+		// One bummer is there's no way to know where the boundary of a protobuf is. We could
+		// eliminate that if we stored things more closely to the file format of the bitcask
+		// paper, and stored both sizes and offsets, and ditched protobufs completely.
 		for {
-			var sfOffset int64
-			entry, sfOffset, err := readProtoFromFile(sf, sfOffset)
-			if err == io.EOF {
-				break
+			entry, newOffset, err := readProtoFromFile(sf, sfOffset)
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					// TODO: handle this more gracefully
+					panic(err)
+				}
 			}
 
-			kd := &KeyDir{
-				Timestamp: entry.EntryData.Timestamp,
-				FileId:    de.Name(),
-				Offset:    sfOffset,
+			// deleted values should get removed if they've already been populated from
+			// previous records or not added if this is the first time we're seeing them.
+			if bytes.Equal(entry.EntryData.Value, tombstoneValue) {
+				_, ok := d.data[entry.EntryData.Key]
+
+				if ok {
+					delete(d.data, entry.EntryData.Key)
+				}
+			} else {
+				kd := &KeyDir{
+					Timestamp: entry.EntryData.Timestamp,
+					FileId:    dePath,
+					Offset:    sfOffset,
+				}
+
+				d.data[entry.EntryData.Key] = kd
 			}
 
-			d.m.Lock()
-			d.data[entry.EntryData.Key] = kd
-			d.m.Unlock()
+			sfOffset = newOffset
+		}
+
+		if filepath.Ext(dePath) == ".active" {
+			d.offset.Store(sfOffset)
+			activeFile = dePath
 		}
 
 		_ = sf.Close()
+	}
+
+	if activeFile != "" {
+		err = d.storeActiveFile(activeFile)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (d *DB) fileRotation() {
-	for {
-		fi, err := d.activeFile.Stat()
-		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
-		}
+	fi, err := d.activeFile.Stat()
+	if err != nil {
+		// TODO: handle this more gracefully
+		panic(err)
+	}
 
-		if fi.Size() < fileSizeThreshold {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
+	if fi.Size() < fileSizeThreshold {
+		return
+	}
 
-		// file has exceeded the threshold, close it and start a new one
-		d.m.Lock()
-		err = d.activeFile.Sync()
-		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
-		}
+	// file has exceeded the threshold, close it and start a new one
+	d.m.Lock()
+	err = d.activeFile.Sync()
+	if err != nil {
+		// TODO: handle this more gracefully
+		panic(err)
+	}
 
-		err = d.activeFile.Close()
-		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
-		}
+	err = d.activeFile.Close()
+	if err != nil {
+		// TODO: handle this more gracefully
+		panic(err)
+	}
 
-		// rename existing file
-		fullPath := filepath.Join(d.baseDir, fi.Name())
-		parts := strings.Split(fi.Name(), ".")
-		newPath := fmt.Sprintf("%s.stable", parts[0])
-		err = os.Rename(fullPath, newPath)
+	// rename existing file
+	fullPath := filepath.Join(d.baseDir, fi.Name())
+	parts := strings.Split(fi.Name(), ".")
+	newPath := fmt.Sprintf("%s.stable", parts[0])
+	err = os.Rename(fullPath, newPath)
 
-		// start a new file
-		err = d.newActiveFile()
-		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
-		}
-		d.m.Unlock()
+	// start a new file
+	err = d.newActiveFile()
+	if err != nil {
+		// TODO: handle this more gracefully
+		panic(err)
+	}
+	d.m.Unlock()
 
-		if !d.compactionRunning.Load() {
-			go d.compactStableFiles()
-		}
+	if !d.compactionRunning.Load() {
+		go d.compactStableFiles()
 	}
 }
 
 // TODO: this should be writing out hint files
 func (d *DB) compactStableFiles() {
+	if d.compactionRunning.Load() {
+		return
+	}
+
 	d.compactionRunning.Store(true)
-	defer d.compactionRunning.Store(false)
+	defer func() {
+		d.compactionCh <- struct{}{}
+		d.compactionRunning.Store(false)
+	}()
 
 	d.m.RLock()
 	baseDir := d.baseDir
 	d.m.RUnlock()
 
-	toDelete := make(map[string]struct{}, 0)
+	toDelete := make(map[string]struct{})
 	latestVersions := make(map[string]*Entry)
 
 	f, err := os.Open(baseDir)
@@ -276,11 +346,20 @@ func (d *DB) compactStableFiles() {
 	}
 
 	for _, de := range dirEntries {
-		if filepath.Ext(de.Name()) != "stable" {
+		if ok, err := filepath.Match("bitcask.[0-9]*.*", de.Name()); !ok {
+			if err != nil {
+				// TODO: handle this more gracefully
+				panic(err)
+			}
 			continue
 		}
 
-		sf, err := os.Open(de.Name())
+		dePath := filepath.Join(baseDir, de.Name())
+		if filepath.Ext(dePath) != ".stable" {
+			continue
+		}
+
+		sf, err := os.Open(dePath)
 		if err != nil {
 			// TODO: handle this more gracefully
 			panic(err)
@@ -308,7 +387,7 @@ func (d *DB) compactStableFiles() {
 			}
 		}
 
-		toDelete[de.Name()] = struct{}{}
+		toDelete[dePath] = struct{}{}
 		_ = sf.Close()
 	}
 
@@ -317,7 +396,7 @@ func (d *DB) compactStableFiles() {
 
 	for _, entry := range latestVersions {
 		if currentSize == 0 {
-			newFileName := fmt.Sprintf("%d.stable", time.Now().UTC().UnixNano())
+			newFileName := fmt.Sprintf("bitcask.%d.stable", time.Now().UTC().UnixNano())
 			newFullPath := filepath.Join(baseDir, newFileName)
 			currentFile, err = os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
 			if err != nil {
@@ -355,7 +434,7 @@ func (d *DB) compactStableFiles() {
 
 // this should be called either at startup or with the lock held
 func (d *DB) newActiveFile() error {
-	fileName := fmt.Sprintf("%d.active", time.Now().UTC().UnixNano())
+	fileName := fmt.Sprintf("bitcask.%d.active", time.Now().UTC().UnixNano())
 	newFullPath := filepath.Join(d.baseDir, fileName)
 	f, err := os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
@@ -364,6 +443,17 @@ func (d *DB) newActiveFile() error {
 
 	d.activeFile = f
 	d.offset.Store(0)
+	return nil
+}
+
+// this should be called either at startup or with the lock held
+func (d *DB) storeActiveFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+
+	d.activeFile = f
 	return nil
 }
 
@@ -380,12 +470,10 @@ func makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
 		return nil, fmt.Errorf("error marshaling data: %w", err)
 	}
 
-	entry := &Entry{
+	return &Entry{
 		Crc:       entryDataChecksum(edBytes),
 		EntryData: ed,
-	}
-
-	return entry, nil
+	}, nil
 }
 
 func writeProtoToFile(f *os.File, entry *Entry, offset int64) (int64, error) {
