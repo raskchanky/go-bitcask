@@ -22,14 +22,14 @@ import (
 
 const (
 	// each file can be 10MB in size
-	fileSizeThreshold = 10 * 1024 * 1024
+	fileSizeThreshold = int64(10 * 1024)
 	sizeBufferSize    = 4
 )
 
 /*
 TODO:
 - Consider replacing protobufs with some other serialization format, e.g. msgpack and following the file format laid
-  out in the paper more closely. I'm not entirely clear how much value there is here, other than adherance to the
+  out in the paper more closely. I'm not entirely clear how much value there is here, other than adherence to the
   paper. Off the cuff, it feels like a wash.
 - Implement hint files as described in the paper.
 - Test file rotation
@@ -54,6 +54,10 @@ type DB struct {
 	offset            *atomic.Int64
 	compactionRunning *atomic.Bool
 	compactionCh      chan struct{}
+	skipRotation      *atomic.Bool
+	skipCompaction    *atomic.Bool
+	errCh             chan error
+	writeCount        int
 }
 
 // Open creates a new database at the given path and returns a handle to it along with any errors.
@@ -64,6 +68,9 @@ func Open(baseDir string) (*DB, error) {
 		compactionRunning: atomic.NewBool(false),
 		data:              make(map[string]*KeyDir),
 		compactionCh:      make(chan struct{}),
+		skipRotation:      atomic.NewBool(false),
+		skipCompaction:    atomic.NewBool(false),
+		errCh:             make(chan error, 1024),
 	}
 
 	fi, err := os.Stat(baseDir)
@@ -122,9 +129,8 @@ func (d *DB) Put(key string, val []byte) error {
 	d.offset.Store(currentOffset)
 
 	// update in memory map, using the starting instead of ending offset
-	fullPath := filepath.Join(d.baseDir, d.activeFile.Name())
 	d.data[key] = &KeyDir{
-		FileId:    fullPath,
+		FileId:    d.activeFile.Name(),
 		Offset:    startingOffset,
 		Timestamp: entry.EntryData.Timestamp,
 	}
@@ -134,7 +140,13 @@ func (d *DB) Put(key string, val []byte) error {
 		return err
 	}
 
-	go d.fileRotation()
+	d.writeCount++
+
+	if !d.skipRotation.Load() && d.writeCount > 100 {
+		d.writeCount = 0
+		go d.fileRotation(fileSizeThreshold)
+	}
+
 	return nil
 }
 
@@ -173,6 +185,7 @@ func (d *DB) Close() error {
 	}
 
 	close(d.compactionCh)
+	close(d.errCh)
 
 	d.m.Lock()
 	err := d.activeFile.Close()
@@ -186,7 +199,45 @@ func (d *DB) Close() error {
 }
 
 func (d *DB) Path() string {
+	d.m.RLock()
+	defer d.m.RUnlock()
 	return d.baseDir
+}
+
+func (d *DB) Size() (int64, error) {
+	baseDir := d.Path()
+	var size int64
+
+	f, err := os.Open(baseDir)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	dirEntries, err := f.ReadDir(0)
+	if err != nil {
+		return 0, err
+	}
+
+	if len(dirEntries) == 0 {
+		return 0, nil
+	}
+
+	for _, de := range dirEntries {
+		if !filenameRegex.MatchString(de.Name()) {
+			continue
+		}
+
+		dePath := filepath.Join(baseDir, de.Name())
+		fi, err := os.Stat(dePath)
+		if err != nil {
+			return 0, err
+		}
+
+		size += fi.Size()
+	}
+
+	return size, nil
 }
 
 // populateData checks to see if there are files in the base directory. If so, it uses them to populate
@@ -280,42 +331,50 @@ func (d *DB) populateData() error {
 	return nil
 }
 
-func (d *DB) fileRotation() {
+func (d *DB) fileRotation(sizeThreshold int64) {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	log.Println("starting active file rotation")
+
 	fi, err := d.activeFile.Stat()
 	if err != nil {
 		log.Printf("Error during file rotation: %v", err)
+		d.errCh <- err
 	}
 
-	if fi.Size() < fileSizeThreshold {
+	if fi.Size() < sizeThreshold {
 		return
 	}
 
 	// file has exceeded the threshold, close it and start a new one
-	d.m.Lock()
 	err = d.activeFile.Sync()
 	if err != nil {
 		log.Printf("Error during file rotation: %v", err)
+		d.errCh <- err
 	}
 
 	err = d.activeFile.Close()
 	if err != nil {
 		log.Printf("Error during file rotation: %v", err)
+		d.errCh <- err
 	}
 
 	// rename existing file
 	fullPath := filepath.Join(d.baseDir, fi.Name())
 	parts := strings.Split(fi.Name(), ".")
-	newPath := fmt.Sprintf("%s.stable", parts[0])
+	newName := fmt.Sprintf("%s.%s.stable", parts[0], parts[1])
+	newPath := filepath.Join(d.baseDir, newName)
 	err = os.Rename(fullPath, newPath)
 
 	// start a new file
 	err = d.newActiveFile()
 	if err != nil {
 		log.Printf("Error during file rotation: %v", err)
+		d.errCh <- err
 	}
-	d.m.Unlock()
 
-	if !d.compactionRunning.Load() {
+	if !d.skipCompaction.Load() && !d.compactionRunning.Load() {
 		go d.compactStableFiles()
 	}
 }
@@ -332,6 +391,8 @@ func (d *DB) compactStableFiles() {
 		d.compactionRunning.Store(false)
 	}()
 
+	log.Println("starting stable file compaction")
+
 	d.m.RLock()
 	baseDir := d.baseDir
 	d.m.RUnlock()
@@ -342,18 +403,21 @@ func (d *DB) compactStableFiles() {
 	f, err := os.Open(baseDir)
 	if err != nil {
 		log.Printf("Error during file compaction: %v", err)
+		d.errCh <- err
 	}
 	defer func() { _ = f.Close() }()
 
 	dirEntries, err := f.ReadDir(0)
 	if err != nil {
 		log.Printf("Error during file compaction: %v", err)
+		d.errCh <- err
 	}
 
 	for _, de := range dirEntries {
 		if ok, err := filepath.Match("bitcask.[0-9]*.*", de.Name()); !ok {
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
+				d.errCh <- err
 			}
 			continue
 		}
@@ -366,13 +430,19 @@ func (d *DB) compactStableFiles() {
 		sf, err := os.Open(dePath)
 		if err != nil {
 			log.Printf("Error during file compaction: %v", err)
+			d.errCh <- err
 		}
 
 		for {
 			var sfOffset int64
 			entry, sfOffset, err := readProtoFromFile(sf, sfOffset)
-			if err == io.EOF {
-				break
+			if err != nil {
+				if err == io.EOF {
+					break
+				} else {
+					log.Printf("Error during file compaction: %v", err)
+					d.errCh <- err
+				}
 			}
 			key := entry.EntryData.Key
 
@@ -404,12 +474,14 @@ func (d *DB) compactStableFiles() {
 			currentFile, err = os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
+				d.errCh <- err
 			}
 		}
 
 		endingOffset, err = writeProtoToFile(currentFile, entry, startingOffset)
 		if err != nil {
 			log.Printf("Error during file compaction: %v", err)
+			d.errCh <- err
 		}
 		currentSize += endingOffset - startingOffset
 		startingOffset = endingOffset
@@ -418,6 +490,7 @@ func (d *DB) compactStableFiles() {
 			err = currentFile.Close()
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
+				d.errCh <- err
 			}
 			currentSize = 0
 		}
@@ -427,6 +500,7 @@ func (d *DB) compactStableFiles() {
 		err := os.Remove(k)
 		if err != nil {
 			log.Printf("Error during file compaction: %v", err)
+			d.errCh <- err
 		}
 	}
 }

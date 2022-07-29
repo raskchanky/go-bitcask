@@ -114,3 +114,40 @@ func TestCRUD(t *testing.T) {
 		t.Fatalf("expected %v to equal %v but it didn't", keys, expectedKeys)
 	}
 }
+
+func TestFileRotation(t *testing.T) {
+	d, err := testDB(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = os.RemoveAll(d.Path()) }()
+
+	d.skipCompaction.Store(true)
+	d.skipRotation.Store(true)
+
+	// write out a bunch of data, then manually rotate the active file
+	for i := 0; i < 1000; i++ {
+		err := d.Put(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("value-%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	currentSize, err := d.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d.fileRotation(currentSize - 10)
+	err = d.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for e := range d.errCh {
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+}
