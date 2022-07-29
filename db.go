@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -24,6 +25,19 @@ const (
 	fileSizeThreshold = 10 * 1024 * 1024
 	sizeBufferSize    = 4
 )
+
+/*
+TODO:
+- Consider replacing protobufs with some other serialization format, e.g. msgpack and following the file format laid
+  out in the paper more closely. I'm not entirely clear how much value there is here, other than adherance to the
+  paper. Off the cuff, it feels like a wash.
+- Implement hint files as described in the paper.
+- Test file rotation
+- Test stable file compaction
+- Test concurrency
+- Test performance
+- Better error handling
+*/
 
 var (
 	ErrNotFound         = errors.New("bitcask: not found")
@@ -185,15 +199,13 @@ func (d *DB) populateData() error {
 	var activeFile string
 	f, err := os.Open(d.baseDir)
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
 	dirEntries, err := f.ReadDir(0)
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		return err
 	}
 
 	if len(dirEntries) == 0 {
@@ -202,31 +214,30 @@ func (d *DB) populateData() error {
 
 	for _, de := range dirEntries {
 		if !filenameRegex.MatchString(de.Name()) {
-			// TODO: log this somehow
+			// TODO: should this be logged somehow?
 			continue
 		}
 
 		dePath := filepath.Join(d.baseDir, de.Name())
 		sf, err := os.Open(dePath)
 		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
+			return err
 		}
 
 		sfOffset := int64(0)
 		// TODO: this would probably work better with some kind of buffering, e.g. read in
 		// 4K at a time from the file and process that, rather than reading record at a time.
-		// One bummer is there's no way to know where the boundary of a protobuf is. We could
-		// eliminate that if we stored things more closely to the file format of the bitcask
-		// paper, and stored both sizes and offsets, and ditched protobufs completely.
+		// One bummer is there's no way to know where the boundary of a protobuf is. Even if we
+		// followed the file format described in the paper more closely, it's not entirely clear
+		// if that would be better than protobufs for this particular problem (I'm guessing not).
+		// It's also not clear if this is an actual bottleneck or an imaginary one.
 		for {
 			entry, newOffset, err := readProtoFromFile(sf, sfOffset)
 			if err != nil {
 				if err == io.EOF {
 					break
 				} else {
-					// TODO: handle this more gracefully
-					panic(err)
+					return err
 				}
 			}
 
@@ -272,8 +283,7 @@ func (d *DB) populateData() error {
 func (d *DB) fileRotation() {
 	fi, err := d.activeFile.Stat()
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		log.Printf("Error during file rotation: %v", err)
 	}
 
 	if fi.Size() < fileSizeThreshold {
@@ -284,14 +294,12 @@ func (d *DB) fileRotation() {
 	d.m.Lock()
 	err = d.activeFile.Sync()
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		log.Printf("Error during file rotation: %v", err)
 	}
 
 	err = d.activeFile.Close()
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		log.Printf("Error during file rotation: %v", err)
 	}
 
 	// rename existing file
@@ -303,8 +311,7 @@ func (d *DB) fileRotation() {
 	// start a new file
 	err = d.newActiveFile()
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		log.Printf("Error during file rotation: %v", err)
 	}
 	d.m.Unlock()
 
@@ -334,22 +341,19 @@ func (d *DB) compactStableFiles() {
 
 	f, err := os.Open(baseDir)
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		log.Printf("Error during file compaction: %v", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	dirEntries, err := f.ReadDir(0)
 	if err != nil {
-		// TODO: handle this more gracefully
-		panic(err)
+		log.Printf("Error during file compaction: %v", err)
 	}
 
 	for _, de := range dirEntries {
 		if ok, err := filepath.Match("bitcask.[0-9]*.*", de.Name()); !ok {
 			if err != nil {
-				// TODO: handle this more gracefully
-				panic(err)
+				log.Printf("Error during file compaction: %v", err)
 			}
 			continue
 		}
@@ -361,8 +365,7 @@ func (d *DB) compactStableFiles() {
 
 		sf, err := os.Open(dePath)
 		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
+			log.Printf("Error during file compaction: %v", err)
 		}
 
 		for {
@@ -400,15 +403,13 @@ func (d *DB) compactStableFiles() {
 			newFullPath := filepath.Join(baseDir, newFileName)
 			currentFile, err = os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
 			if err != nil {
-				// TODO: handle this more gracefully
-				panic(err)
+				log.Printf("Error during file compaction: %v", err)
 			}
 		}
 
 		endingOffset, err = writeProtoToFile(currentFile, entry, startingOffset)
 		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
+			log.Printf("Error during file compaction: %v", err)
 		}
 		currentSize += endingOffset - startingOffset
 		startingOffset = endingOffset
@@ -416,8 +417,7 @@ func (d *DB) compactStableFiles() {
 		if currentSize >= fileSizeThreshold {
 			err = currentFile.Close()
 			if err != nil {
-				// TODO: handle this more gracefully
-				panic(err)
+				log.Printf("Error during file compaction: %v", err)
 			}
 			currentSize = 0
 		}
@@ -426,8 +426,7 @@ func (d *DB) compactStableFiles() {
 	for k := range toDelete {
 		err := os.Remove(k)
 		if err != nil {
-			// TODO: handle this more gracefully
-			panic(err)
+			log.Printf("Error during file compaction: %v", err)
 		}
 	}
 }
