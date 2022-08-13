@@ -22,8 +22,10 @@ import (
 
 const (
 	// each file can be 10MB in size
-	fileSizeThreshold = int64(10 * 1024)
-	sizeBufferSize    = 4
+	// fileSizeThreshold = int64(10 * 1024)
+	fileSizeThreshold  = int64(100)
+	rotationWriteCount = 2
+	sizeBufferSize     = 4
 )
 
 /*
@@ -53,7 +55,6 @@ type DB struct {
 	m                 sync.RWMutex
 	offset            *atomic.Int64
 	compactionRunning *atomic.Bool
-	compactionCh      chan struct{}
 	skipRotation      *atomic.Bool
 	skipCompaction    *atomic.Bool
 	errCh             chan error
@@ -67,7 +68,6 @@ func Open(baseDir string) (*DB, error) {
 		offset:            atomic.NewInt64(0),
 		compactionRunning: atomic.NewBool(false),
 		data:              make(map[string]*KeyDir),
-		compactionCh:      make(chan struct{}),
 		skipRotation:      atomic.NewBool(false),
 		skipCompaction:    atomic.NewBool(false),
 		errCh:             make(chan error, 1024),
@@ -96,6 +96,10 @@ func (d *DB) Get(key string) ([]byte, error) {
 	d.m.RLock()
 	kd, ok := d.data[key]
 	d.m.RUnlock()
+
+	if ok {
+		log.Printf("getting kd for key %s. fileid = %s\n", key, kd.FileId)
+	}
 
 	if !ok {
 		return nil, ErrNotFound
@@ -142,7 +146,7 @@ func (d *DB) Put(key string, val []byte) error {
 
 	d.writeCount++
 
-	if !d.skipRotation.Load() && d.writeCount > 100 {
+	if !d.skipRotation.Load() && d.writeCount > rotationWriteCount {
 		d.writeCount = 0
 		go d.fileRotation(fileSizeThreshold)
 	}
@@ -180,11 +184,15 @@ func (d *DB) List() []string {
 
 func (d *DB) Close() error {
 	// Wait for compaction to finish if it's in progress
-	if d.compactionRunning.Load() {
-		<-d.compactionCh
+	for {
+		if d.compactionRunning.Load() {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+
+		break
 	}
 
-	close(d.compactionCh)
 	close(d.errCh)
 
 	d.m.Lock()
@@ -331,6 +339,8 @@ func (d *DB) populateData() error {
 	return nil
 }
 
+// TODO: it's probably worth buffering incoming writes while this function runs, since it holds the write lock,
+// TODO: and replaying them after it finishes
 func (d *DB) fileRotation(sizeThreshold int64) {
 	d.m.Lock()
 	defer d.m.Unlock()
@@ -344,16 +354,19 @@ func (d *DB) fileRotation(sizeThreshold int64) {
 	}
 
 	if fi.Size() < sizeThreshold {
+		log.Printf("active file size (%d) is below size threshold (%d), returning early\n", fi.Size(), sizeThreshold)
 		return
 	}
 
 	// file has exceeded the threshold, close it and start a new one
+	log.Printf("syncing active file - %s\n", d.activeFile.Name())
 	err = d.activeFile.Sync()
 	if err != nil {
 		log.Printf("Error during file rotation: %v", err)
 		d.errCh <- err
 	}
 
+	log.Printf("closing active file - %s\n", d.activeFile.Name())
 	err = d.activeFile.Close()
 	if err != nil {
 		log.Printf("Error during file rotation: %v", err)
@@ -366,6 +379,14 @@ func (d *DB) fileRotation(sizeThreshold int64) {
 	newName := fmt.Sprintf("%s.%s.stable", parts[0], parts[1])
 	newPath := filepath.Join(d.baseDir, newName)
 	err = os.Rename(fullPath, newPath)
+	log.Printf("active file renamed from %s to %s\n", fullPath, newPath)
+
+	// TODO: this is likely inefficient. it might be worth storing a reverse mapping from fileid to keys to make this faster
+	for _, kd := range d.data {
+		if kd.FileId == fullPath {
+			kd.FileId = newPath
+		}
+	}
 
 	// start a new file
 	err = d.newActiveFile()
@@ -373,8 +394,10 @@ func (d *DB) fileRotation(sizeThreshold int64) {
 		log.Printf("Error during file rotation: %v", err)
 		d.errCh <- err
 	}
+	log.Printf("new active file started - %s\n", d.activeFile.Name())
 
 	if !d.skipCompaction.Load() && !d.compactionRunning.Load() {
+		log.Println("starting file compaction background task")
 		go d.compactStableFiles()
 	}
 }
@@ -382,13 +405,14 @@ func (d *DB) fileRotation(sizeThreshold int64) {
 // TODO: this should be writing out hint files
 func (d *DB) compactStableFiles() {
 	if d.compactionRunning.Load() {
+		log.Println("compaction is already running, returning")
 		return
 	}
 
 	d.compactionRunning.Store(true)
 	defer func() {
-		d.compactionCh <- struct{}{}
 		d.compactionRunning.Store(false)
+		log.Println("stable file compaction finished")
 	}()
 
 	log.Println("starting stable file compaction")
@@ -414,16 +438,20 @@ func (d *DB) compactStableFiles() {
 	}
 
 	for _, de := range dirEntries {
+		log.Printf("examining %s\n", de.Name())
 		if ok, err := filepath.Match("bitcask.[0-9]*.*", de.Name()); !ok {
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
 				d.errCh <- err
 			}
+
+			log.Printf("%s is not a bitcask file, skipping\n")
 			continue
 		}
 
 		dePath := filepath.Join(baseDir, de.Name())
 		if filepath.Ext(dePath) != ".stable" {
+			log.Printf("%s is not a stable bitcask file, skipping\n", dePath)
 			continue
 		}
 
@@ -433,11 +461,14 @@ func (d *DB) compactStableFiles() {
 			d.errCh <- err
 		}
 
+		sfOffset := int64(0)
+
 		for {
-			var sfOffset int64
-			entry, sfOffset, err := readProtoFromFile(sf, sfOffset)
+			// log.Printf("reading from %s at offset %d\n", dePath, sfOffset)
+			entry, newOffset, err := readProtoFromFile(sf, sfOffset)
 			if err != nil {
 				if err == io.EOF {
+					// log.Printf("reached the end of %s\n", dePath)
 					break
 				} else {
 					log.Printf("Error during file compaction: %v", err)
@@ -451,15 +482,21 @@ func (d *DB) compactStableFiles() {
 			d.m.RUnlock()
 
 			if !ok {
+				log.Printf("no keydir found for key %s, skipping to the next record\n", key)
+				sfOffset = newOffset
 				continue
 			}
 
 			lv, ok := latestVersions[key]
 			if !ok || entry.EntryData.Timestamp > lv.EntryData.Timestamp {
+				log.Printf("found a new latest version for key %s: %d\n", key, entry.EntryData.Timestamp)
 				latestVersions[key] = entry
 			}
+
+			sfOffset = newOffset
 		}
 
+		log.Printf("marking %s for deletion\n", dePath)
 		toDelete[dePath] = struct{}{}
 		_ = sf.Close()
 	}
@@ -469,8 +506,9 @@ func (d *DB) compactStableFiles() {
 
 	for _, entry := range latestVersions {
 		if currentSize == 0 {
-			newFileName := fmt.Sprintf("bitcask.%d.stable", time.Now().UTC().UnixNano())
+			newFileName := fmt.Sprintf("bitcask.%d.stable", time.Now().UnixNano())
 			newFullPath := filepath.Join(baseDir, newFileName)
+			log.Printf("creating a new stable file: %s\n", newFullPath)
 			currentFile, err = os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
@@ -483,10 +521,26 @@ func (d *DB) compactStableFiles() {
 			log.Printf("Error during file compaction: %v", err)
 			d.errCh <- err
 		}
+
+		d.m.Lock()
+		kd, ok := d.data[entry.EntryData.Key]
+		if ok {
+			log.Printf("existing keydir found for %s. fileid = %s\n", entry.EntryData.Key, kd.FileId)
+		}
+		d.data[entry.EntryData.Key] = &KeyDir{
+			FileId:    currentFile.Name(),
+			Offset:    startingOffset,
+			Timestamp: time.Now().UnixNano(),
+		}
+		log.Printf("keydir updated for %s. new fileid = %s\n", entry.EntryData.Key, currentFile.Name())
+		d.m.Unlock()
+
 		currentSize += endingOffset - startingOffset
 		startingOffset = endingOffset
+		// log.Printf("current size after writing to %s is %d\n", currentFile.Name(), currentSize)
 
 		if currentSize >= fileSizeThreshold {
+			log.Printf("size of current file (%d) has exceeded the file size threshold (%d), closing file\n", currentSize, fileSizeThreshold)
 			err = currentFile.Close()
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
@@ -496,7 +550,16 @@ func (d *DB) compactStableFiles() {
 		}
 	}
 
+	d.m.RLock()
+	fmt.Println("iterating over existing keydirs")
+	for k, kd := range d.data {
+		fmt.Printf("k = %s\n", k)
+		fmt.Printf("fileid = %s\n", kd.FileId)
+	}
+	d.m.RUnlock()
+
 	for k := range toDelete {
+		log.Printf("deleting %s\n", k)
 		err := os.Remove(k)
 		if err != nil {
 			log.Printf("Error during file compaction: %v", err)
@@ -507,7 +570,7 @@ func (d *DB) compactStableFiles() {
 
 // this should be called either at startup or with the lock held
 func (d *DB) newActiveFile() error {
-	fileName := fmt.Sprintf("bitcask.%d.active", time.Now().UTC().UnixNano())
+	fileName := fmt.Sprintf("bitcask.%d.active", time.Now().UnixNano())
 	newFullPath := filepath.Join(d.baseDir, fileName)
 	f, err := os.OpenFile(newFullPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
