@@ -75,7 +75,7 @@ func Open(baseDir string) (*DB, error) {
 
 	fi, err := os.Stat(baseDir)
 	if err == nil && !fi.IsDir() {
-		return nil, errors.New(fmt.Sprintf("%s is not a directory", baseDir))
+		return nil, fmt.Errorf("%s is not a directory", baseDir)
 	}
 
 	err = os.MkdirAll(baseDir, 0o700)
@@ -130,6 +130,9 @@ func (d *DB) Put(key string, val []byte) error {
 	}
 
 	currentOffset, err := writeProtoToFile(d.activeFile, entry, startingOffset)
+	if err != nil {
+		return err
+	}
 	d.offset.Store(currentOffset)
 
 	// update in memory map, using the starting instead of ending offset
@@ -379,6 +382,10 @@ func (d *DB) fileRotation(sizeThreshold int64) {
 	newName := fmt.Sprintf("%s.%s.stable", parts[0], parts[1])
 	newPath := filepath.Join(d.baseDir, newName)
 	err = os.Rename(fullPath, newPath)
+	if err != nil {
+		log.Printf("Error during rename: %v", err)
+		d.errCh <- err
+	}
 	log.Printf("active file renamed from %s to %s\n", fullPath, newPath)
 
 	// TODO: this is likely inefficient. it might be worth storing a reverse mapping from fileid to keys to make this faster
@@ -438,18 +445,18 @@ func (d *DB) compactStableFiles() {
 	}
 
 	for _, de := range dirEntries {
-		log.Printf("examining %s\n", de.Name())
+		dePath := filepath.Join(baseDir, de.Name())
+		log.Printf("examining %s\n", dePath)
 		if ok, err := filepath.Match("bitcask.[0-9]*.*", de.Name()); !ok {
 			if err != nil {
 				log.Printf("Error during file compaction: %v", err)
 				d.errCh <- err
 			}
 
-			log.Printf("%s is not a bitcask file, skipping\n")
+			log.Printf("%s is not a bitcask file, skipping\n", dePath)
 			continue
 		}
 
-		dePath := filepath.Join(baseDir, de.Name())
 		if filepath.Ext(dePath) != ".stable" {
 			log.Printf("%s is not a stable bitcask file, skipping\n", dePath)
 			continue
@@ -464,8 +471,9 @@ func (d *DB) compactStableFiles() {
 		sfOffset := int64(0)
 
 		for {
-			// log.Printf("reading from %s at offset %d\n", dePath, sfOffset)
+			log.Printf("reading from %s at offset %d\n", dePath, sfOffset)
 			entry, newOffset, err := readProtoFromFile(sf, sfOffset)
+			log.Printf("just read from %s. entry = %#v, newOffset = %d\n", dePath, entry, newOffset)
 			if err != nil {
 				if err == io.EOF {
 					// log.Printf("reached the end of %s\n", dePath)
@@ -613,6 +621,7 @@ func makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
 }
 
 func writeProtoToFile(f *os.File, entry *Entry, offset int64) (int64, error) {
+	fmt.Printf("-- about to write %#v to %s\n", entry, f.Name())
 	// append to the active file, writing the size first
 	data, err := proto.Marshal(entry)
 	if err != nil {
