@@ -1,6 +1,6 @@
 module github.com/raskchanky/go-bitcask
 
-go 1.18
+go 1.19
 
 require (
 	github.com/Masterminds/goutils v1.1.0 // indirect

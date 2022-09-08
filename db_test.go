@@ -145,9 +145,22 @@ func TestFileRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for e := range d.errCh {
-		if e != nil {
-			t.Fatal(e)
-		}
+	// there should be a new active file and a new stable file
+	f, err := os.Open(d.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dirEntries, err := f.ReadDir(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if del := len(dirEntries); del != 2 {
+		t.Fatalf("expected 2 files, got %d", del)
+	}
+
+	for _, de := range dirEntries {
+		fmt.Printf("-- de.name = %s\n", de.Name())
 	}
 }
