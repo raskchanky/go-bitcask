@@ -58,7 +58,9 @@ type DB struct {
 	skipRotation      *atomic.Bool
 	skipCompaction    *atomic.Bool
 	errCh             chan error
-	writeCount        int
+	writeCount        *atomic.Int64
+	appendCh          chan *Entry
+	appendErrCh       chan error
 }
 
 // Open creates a new database at the given path and returns a handle to it along with any errors.
@@ -71,6 +73,9 @@ func Open(baseDir string) (*DB, error) {
 		skipRotation:      atomic.NewBool(false),
 		skipCompaction:    atomic.NewBool(false),
 		errCh:             make(chan error, 1024),
+		writeCount:        atomic.NewInt64(0),
+		appendCh:          make(chan *Entry, 1024),
+		appendErrCh:       make(chan error),
 	}
 
 	fi, err := os.Stat(baseDir)
@@ -82,6 +87,8 @@ func Open(baseDir string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	go d.appendToFile()
 
 	err = d.populateData()
 	if err != nil {
@@ -123,38 +130,18 @@ func (d *DB) Put(key string, val []byte) error {
 	d.m.Lock()
 	defer d.m.Unlock()
 
-	startingOffset := d.offset.Load()
 	entry, err := makeEntry(key, val, bytes.Equal(tombstoneValue, val))
 	if err != nil {
 		return err
 	}
 
-	currentOffset, err := writeProtoToFile(d.activeFile, entry, startingOffset)
-	if err != nil {
-		return err
+	d.appendCh <- entry
+	// return nil
+	err, ok := <-d.appendErrCh
+	if !ok {
+		return nil
 	}
-	d.offset.Store(currentOffset)
-
-	// update in memory map, using the starting instead of ending offset
-	d.data[key] = &KeyDir{
-		FileId:    d.activeFile.Name(),
-		Offset:    startingOffset,
-		Timestamp: entry.EntryData.Timestamp,
-	}
-
-	err = d.activeFile.Sync()
-	if err != nil {
-		return err
-	}
-
-	d.writeCount++
-
-	if !d.skipRotation.Load() && d.writeCount > rotationWriteCount {
-		d.writeCount = 0
-		go d.fileRotation(fileSizeThreshold)
-	}
-
-	return nil
+	return err
 }
 
 func (d *DB) Delete(key string) error {
@@ -249,6 +236,46 @@ func (d *DB) Size() (int64, error) {
 	}
 
 	return size, nil
+}
+
+func (d *DB) appendToFile() {
+	for {
+		entry, ok := <-d.appendCh
+		if !ok {
+			return
+		}
+
+		startingOffset := d.offset.Load()
+		currentOffset, err := writeProtoToFile(d.activeFile, entry, startingOffset)
+		if err != nil {
+			d.appendErrCh <- err
+			continue
+		}
+		d.offset.Store(currentOffset)
+
+		// update in memory map, using the starting instead of ending offset
+		d.data[entry.EntryData.Key] = &KeyDir{
+			FileId:    d.activeFile.Name(),
+			Offset:    startingOffset,
+			Timestamp: entry.EntryData.Timestamp,
+		}
+
+		// check out how bbolt does this here https://github.com/etcd-io/bbolt/blob/fd5535f71f488dda0915f610b6ca8c77c9ca2c59/tx.go#L558
+		// it uses a system call on linux and the way i'm doing it below on mac. i'm guessing the syscall is faster.
+		err = d.activeFile.Sync()
+		if err != nil {
+			d.appendErrCh <- err
+			continue
+		}
+
+		d.appendErrCh <- nil
+		d.writeCount.Inc()
+
+		if !d.skipRotation.Load() && d.writeCount.Load() > rotationWriteCount {
+			d.writeCount.Store(0)
+			go d.fileRotation(fileSizeThreshold)
+		}
+	}
 }
 
 // populateData checks to see if there are files in the base directory. If so, it uses them to populate
@@ -621,7 +648,6 @@ func makeEntry(key string, val []byte, tombstone bool) (*Entry, error) {
 }
 
 func writeProtoToFile(f *os.File, entry *Entry, offset int64) (int64, error) {
-	fmt.Printf("-- about to write %#v to %s\n", entry, f.Name())
 	// append to the active file, writing the size first
 	data, err := proto.Marshal(entry)
 	if err != nil {
